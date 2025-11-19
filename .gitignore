@@ -1,0 +1,13 @@
+# 1. 【核心】首先忽略根目录下的所有文件和文件夹
+/*
+
+# 2. 【例外】不忽略（即包含）你想要的文件夹
+!/Performance_Eval/
+
+# 3. 【例外】不忽略（即包含）你想要的文件
+!setup.py
+!.gitignore
+
+# 4. 【细节】虽然我们要了 Performance_Eval，但依然要忽略里面的 Python 缓存文件
+__pycache__/
+*.py[cod]
