@@ -25,10 +25,10 @@ class Link:
         Manage network topology and communication link states.
         Each Link object corresponds to one device's communication manager thread.
     """
-    def __init__(self, topo_graph: nx.Graph):
+    def __init__(self, topo_graph: nx.Graph = nx.Graph()):
         self.topo_graph = topo_graph
         self.link_states = self._init_link_states(topo_graph)
-
+        self.cost_model=CostModel()
 
     # --------------------------------------------------------
     # --- Initialization & link management ---
@@ -143,7 +143,10 @@ class Link:
         # comm_type = str(node.target)
         # 使用统一代价模型接口
         # cost_model = CostModel(type=comm_type, input=list(node.all_input_nodes))
-        comm_time = 1.00
+        if not isinstance(node, str):
+            comm_time = self.cost_model.get_communication_time(node) 
+        else:
+            comm_time =0
         return comm_time
 
     # --------------------------------------------------------

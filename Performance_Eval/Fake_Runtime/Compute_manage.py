@@ -12,7 +12,7 @@ class Compute:
     """
     def __init__(self, comp_queue) -> None:
         self.comp_queue = comp_queue
-        
+        self.cost_model=CostModel()
     def check_compute_ready(self,node:fx.Node, mem:dict) -> bool:
         """
             Check whether the data required for computation is ready.
@@ -48,6 +48,6 @@ class Compute:
             Get the computation time of this node.
             
         """
-        #cost_model = CostModel(type=node.target, input=list(node.all_input_nodes))
-        cost_model = 1.00
+        cost_model = self.cost_model.get_computation_time(node)
+        # cost_model = 1.00
         return cost_model
