@@ -1,49 +1,107 @@
+import zmq
+import pickle
 import torch
-import torch.utils.benchmark as benchmark
 import operator
-from typing import Any, Tuple, Dict
+import time
+import sys
+import traceback
+import gc
+from typing import Any, Tuple, Dict, Optional, Callable
+from functools import lru_cache
 
+# 尝试导入 NPU 支持
+try:
+    import torch_npu
+except ImportError:
+    pass
+
+# ==============================================================================
+# 1. 设备上下文管理 (Device Context Abstraction)
+# ==============================================================================
+class DeviceContext:
+    """
+    封装设备特定的操作（同步、计时事件、清空缓存），
+    避免在主循环中重复进行 if-else 检测。
+    """
+    def __init__(self):
+        self.device_type = 'cpu'
+        self.device_str = 'cpu'
+        self.event_cls = None
+        self._sync_func = lambda: None
+        self._empty_cache_func = lambda: None
+
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            self.device_type = 'npu'
+            self.device_str = 'npu:0'
+            self.event_cls = torch.npu.Event
+            self._sync_func = torch.npu.synchronize
+            self._empty_cache_func = torch.npu.empty_cache
+            print(f"✅ [DeviceContext] Activated: NPU ({torch.npu.get_device_name(0)})")
+        elif torch.cuda.is_available():
+            self.device_type = 'cuda'
+            self.device_str = 'cuda:0'
+            self.event_cls = torch.cuda.Event
+            self._sync_func = torch.cuda.synchronize
+            self._empty_cache_func = torch.cuda.empty_cache
+            print(f"✅ [DeviceContext] Activated: CUDA ({torch.cuda.get_device_name(0)})")
+        else:
+            print(f"⚠️ [DeviceContext] Activated: CPU only")
+
+    def synchronize(self):
+        self._sync_func()
+
+    def empty_cache(self):
+        self._empty_cache_func()
+
+    def create_tensor(self, shape, dtype) -> torch.Tensor:
+        # 使用 ones 避免除零错误，不计算梯度以节省显存
+        return torch.ones(shape, dtype=dtype, device=self.device_str).requires_grad_(False)
+
+    def get_timer_events(self):
+        if self.event_cls:
+            return self.event_cls(enable_timing=True), self.event_cls(enable_timing=True)
+        return None, None
+
+# 全局单例
+CTX = DeviceContext()
+
+# ==============================================================================
+# 2. 核心 Benchmark 类
+# ==============================================================================
 class OperatorBenchmark:
     """
     对单一 Torch FX 节点执行算子基准测试。
-    包含详细的 Debug 输出功能，并支持过滤无效 kwargs。
     """
-
-    DEFAULT_MIN_RUN_TIME_SEC = 0.01
-    
-    # 定义需要忽略的 kwargs key，这些不会传给算子执行
-    IGNORED_KWARGS = {"layer_Rank", "Stage"}
+    WARMUP_ITERS = 5
+    RUN_ITERS = 20
+    IGNORED_KWARGS = {"layer_Rank", "Stage", "sharding_spec"} # 扩充常见的不需要的参数
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
-        self.device = torch.device("cuda")
 
-    # ---------------------------------------------------------
-    # 辅助方法：格式化参数信息
-    # ---------------------------------------------------------
-    def _format_arg_info(self, arg: Any) -> str:
-        if isinstance(arg, torch.Tensor):
-            shape_info = list(arg.shape)
-            dtype_info = str(arg.dtype).replace("torch.", "")
-            return f"Tensor(shape={shape_info}, dtype={dtype_info})"
-        elif isinstance(arg, (list, tuple)):
-            items = [self._format_arg_info(x) for x in arg]
-            if isinstance(arg, list):
-                return f"[{', '.join(items)}]"
-            else:
-                return f"({', '.join(items)})"
-        return str(arg)
-
-    # ---------------------------------------------------------
-    # 核心逻辑：解析算子 Target
-    # ---------------------------------------------------------
-    def _resolve_target(self, target_name: str):
+    @lru_cache(maxsize=1024)
+    def _resolve_target(self, target_name: str) -> Optional[Callable]:
+        """
+        解析算子目标，增加缓存以提升重复算子的处理速度。
+        """
         if hasattr(operator, target_name):
             return getattr(operator, target_name)
         if hasattr(torch, target_name):
             return getattr(torch, target_name)
+        
+        # 复杂路径解析 (e.g. torch.ops.aten.add.Tensor)
         if "." in target_name:
             parts = target_name.split(".")
+            obj = torch
+            try:
+                for part in parts:
+                    if part == 'torch': continue
+                    obj = getattr(obj, part)
+                return obj
+            except AttributeError:
+                pass
+            
+            # 尝试 aten ops
             if len(parts) >= 2:
                 op_name, op_variant = parts[0], parts[1]
                 if hasattr(torch.ops.aten, op_name):
@@ -52,101 +110,207 @@ class OperatorBenchmark:
                         return getattr(aten_op, op_variant)
         return None
 
-    # ---------------------------------------------------------
-    # 执行单算子 Benchmark
-    # ---------------------------------------------------------
-    def benchmark(
-        self,
-        node: Any,
-        dummy_args: Tuple[Any, ...],
-        dummy_kwargs: Dict[str, Any],
-    ) -> Tuple[bool, float]:
+    def _format_arg_summary(self, args, kwargs) -> str:
+        if not self.verbose: return ""
+        # 简化的参数打印，避免递归过深
+        def simple_fmt(x):
+            if isinstance(x, torch.Tensor):
+                return f"Tensor({list(x.shape)}, {str(x.dtype).replace('torch.', '')})"
+            return str(type(x).__name__)
         
+        arg_str = ", ".join([simple_fmt(a) for a in args])
+        return f"Args: [{arg_str}]"
+
+    def benchmark(self, node: Any, dummy_args: Tuple[Any, ...], dummy_kwargs: Dict[str, Any]) -> Tuple[bool, float]:
         target_str = str(node.target)
-
         try:
-            # 1. 尝试解析 target
+            # 1. 解析函数
             op_func = self._resolve_target(target_str)
+            filtered_kwargs = {k: v for k, v in dummy_kwargs.items() if k not in self.IGNORED_KWARGS}
 
-            # =========================================================
-            # [新增步骤] 过滤不需要的 kwargs (如 layer_Rank, Stage)
-            # =========================================================
-            # 使用字典推导式过滤掉在 IGNORED_KWARGS 中的 key
-            filtered_kwargs = {
-                k: v for k, v in dummy_kwargs.items() 
-                if k not in self.IGNORED_KWARGS
-            }
+            func_to_run = None
+            run_args = dummy_args
+            run_kwargs = filtered_kwargs
+            real_op_name = target_str
 
-            # 2. 构造执行环境 globals_dict (注意：这里用的是 filtered_kwargs)
-            globals_dict = {
-                "args": dummy_args,
-                "kwargs": filtered_kwargs
-            }
-
-            real_op_name = target_str 
-
-            # 3. 确定 op 对象并调整参数
+            # 2. 确定调用方式 (Function vs Method)
             if op_func is not None:
-                # === 情况 A: call_function / call_module ===
-                globals_dict["op"] = op_func
-                if hasattr(op_func, "__name__"):
-                    real_op_name = op_func.__name__
+                real_op_name = getattr(op_func, "__name__", target_str)
+                func_to_run = op_func
+            elif node.op == "call_method":
+                method_name = target_str
+                obj = dummy_args[0]
+                if not hasattr(obj, method_name):
+                    raise RuntimeError(f"Object {type(obj)} has no method: {method_name}")
+                func_to_run = getattr(obj, method_name)
+                run_args = dummy_args[1:] # self 是 obj，从 args 移除
+                real_op_name = f"Tensor.{method_name}"
             else:
-                # === 情况 B: call_method (例如 x.add(y)) ===
-                if node.op == "call_method":
-                    method_name = target_str
-                    obj = dummy_args[0]
-                    if not hasattr(obj, method_name):
-                        raise RuntimeError(f"Tensor no method: {method_name}")
-                    
-                    real_method = getattr(obj, method_name)
-                    globals_dict["op"] = real_method
-                    # call_method 的第一个参数是 self，传给 op 时要去掉
-                    globals_dict["args"] = dummy_args[1:] 
-                    real_op_name = f"Tensor.{method_name}"
-                else:
-                    raise RuntimeError(f"Unresolvable target: {target_str}")
+                raise RuntimeError(f"Unresolvable target: {target_str}")
 
-            # =========================================================
-            # [Debug Log] 打印详细信息 (使用过滤后的 filtered_kwargs)
-            # =========================================================
             if self.verbose:
-                # 1. 提取 args 的 info
-                args_info = [self._format_arg_info(a) for a in globals_dict["args"]]
-                
-                # 2. 提取 kwargs 的 info (只显示传给算子的参数)
-                kwargs_info = [f"{k}={self._format_arg_info(v)}" for k, v in filtered_kwargs.items()]
-                
-                # 3. 拼装完整调用签名
-                full_params = ", ".join(args_info + kwargs_info)
-                
-                print("-" * 60, flush=True)
-                print(f"[Debug Exec] Node:      {node.name}", flush=True)
-                print(f"[Debug Exec] Stmt:      op(*args, **kwargs)", flush=True)
-                print(f"[Debug Exec] Details:   {real_op_name}({full_params})", flush=True)
-                print("-" * 60, flush=True)
-            # =========================================================
+                print("-" * 60)
+                print(f"[Run] Node: {node.name} | Op: {real_op_name}")
+                print(f"[Run] {self._format_arg_summary(dummy_args, dummy_kwargs)}")
 
-            # 4. 执行 Timer
-            stmt = "op(*args, **kwargs)"
+            # 3. 执行计时
+            CTX.synchronize() # 预同步，确保之前的操作完成
+
+            # Warmup
+            for _ in range(self.WARMUP_ITERS):
+                func_to_run(*run_args, **run_kwargs)
             
-            timer = benchmark.Timer(
-                stmt=stmt,
-                globals=globals_dict,
-                label=f"Operator: {node.name}"
-            )
+            CTX.synchronize() # Warmup 结束同步
 
-            measurement = timer.blocked_autorange(
-                min_run_time=self.DEFAULT_MIN_RUN_TIME_SEC
-            )
-            mean_time = float(measurement.mean)
+            # Timing Run
+            start_event, end_event = CTX.get_timer_events()
+            
+            if start_event:
+                # GPU/NPU 计时路径
+                start_event.record()
+                for _ in range(self.RUN_ITERS):
+                    func_to_run(*run_args, **run_kwargs)
+                end_event.record()
+                CTX.synchronize() # 等待 Event 记录完成
+                total_ms = start_event.elapsed_time(end_event)
+                mean_time_sec = (total_ms / self.RUN_ITERS) / 1000.0
+            else:
+                # CPU 计时路径
+                start_t = time.perf_counter()
+                for _ in range(self.RUN_ITERS):
+                    func_to_run(*run_args, **run_kwargs)
+                end_t = time.perf_counter()
+                mean_time_sec = (end_t - start_t) / self.RUN_ITERS
 
             if self.verbose:
-                print(f"[Benchmark] {node.name} = {mean_time*1e6:.2f} us", flush=True)
+                print(f"[Result] {mean_time_sec * 1e6:.2f} us")
 
-            return True, mean_time
+            return True, mean_time_sec
 
         except Exception as e:
             if self.verbose:
-                print(f"[Error] Benchmark failed ({node.target}): {e}", flush=True)
+                print(f"❌ [Exec Error] {node.name}: {str(e)}")
+                # traceback.print_exc() # 可选：打印详细堆栈
             return False, 0.0
+        finally:
+            # 这里的 finally 并不一定需要 empty_cache，频繁调用会慢。
+            # 放在 Server 循环末尾调用比较好。
+            pass
+
+# ==============================================================================
+# 3. 数据还原逻辑 (Helper)
+# ==============================================================================
+class DataReconstructor:
+    @staticmethod
+    def _str_to_dtype(dtype_str: str):
+        # 移除可能的前缀
+        clean_str = dtype_str.replace('torch.', '')
+        if hasattr(torch, clean_str):
+            return getattr(torch, clean_str)
+        raise ValueError(f"Unknown dtype string: {dtype_str}")
+
+    @classmethod
+    def reconstruct(cls, arg):
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(cls.reconstruct(x) for x in arg)
+        elif isinstance(arg, dict):
+            # 检测是否为 Tensor Metadata
+            if 'shape' in arg and 'dtype' in arg:
+                try:
+                    dtype = cls._str_to_dtype(arg['dtype'])
+                    return CTX.create_tensor(arg['shape'], dtype)
+                except Exception as e:
+                    print(f"\n❌ [Data Error] Failed to create tensor: {arg}")
+                    raise e
+            return {k: cls.reconstruct(v) for k, v in arg.items()}
+        else:
+            return arg
+
+# ==============================================================================
+# 4. Mock Node (保持不变)
+# ==============================================================================
+class MockNode:
+    def __init__(self, target_str, name_str, op_type='call_function'):
+        self.target = target_str 
+        self.name = name_str
+        self.op = op_type
+
+# ==============================================================================
+# 5. Server 通信逻辑
+# ==============================================================================
+class BenchmarkServer:
+    def __init__(self, port=5555):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        # 设置 Linger 为 0，防止 Ctrl+C 时 socket 卡死
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.bind(f"tcp://*:{port}")
+        
+        self.benchmarker = OperatorBenchmark(verbose=True)
+        print(f"🚀 Benchmark Server Running on {CTX.device_type.upper()} | Port: {port}")
+
+    def start(self):
+        print(">> Waiting for requests...")
+        while True:
+            try:
+                # 1. 接收
+                msg = self.socket.recv()
+                payload = pickle.loads(msg)
+                
+                op_name = payload.get('op', 'unknown')
+                node_name = payload.get('name', 'remote_node')
+                
+                # 2. 构造 Node 和参数
+                mock_node = MockNode(op_name, node_name, op_type='call_function')
+                
+                # 使用专门的重构器，若出错会抛出异常中断本次测试，但被 except 捕获
+                real_args = DataReconstructor.reconstruct(payload['args'])
+                real_kwargs = DataReconstructor.reconstruct(payload['kwargs'])
+
+                # 3. 执行
+                success, cost_time = self.benchmarker.benchmark(
+                    mock_node, 
+                    tuple(real_args), 
+                    real_kwargs
+                )
+
+                # 4. 回复
+                resp = pickle.dumps({'success': success, 'time': cost_time})
+                self.socket.send(resp)
+
+            except Exception as e:
+                print(f"❌ [Server Loop Error] {e}")
+                traceback.print_exc()
+                
+                # 关键：确保 Send 被调用，否则 Client 会一直等待 recv 导致死锁
+                try:
+                    err_resp = pickle.dumps({'success': False, 'time': 0.0, 'error': str(e)})
+                    self.socket.send(err_resp)
+                except zmq.ZMQError:
+                    # 如果 send 也失败（比如 socket 状态错误），通常需要重置 socket
+                    print("⚠️ Critical ZMQ Error during error reporting.")
+            
+            finally:
+                # 5. 清理 (防止 OOM)
+                # 每次请求后简单清理引用
+                del msg, payload
+                if 'real_args' in locals(): del real_args
+                if 'real_kwargs' in locals(): del real_kwargs
+                
+                # NPU/CUDA 显存清理：
+                # 频繁 empty_cache 会导致性能下降，但 Benchmark 场景下稳定性优先
+                # 如果发现太慢，可以加计数器，每 10 次请求清理一次
+                # CTX.empty_cache() 
+                pass
+
+if __name__ == "__main__":
+    # 设置 Python 垃圾回收阈值，稍微激进一点防止 Tensor 泄露
+    gc.set_threshold(700, 10, 10)
+    
+    try:
+        server = BenchmarkServer()
+        server.start()
+    except KeyboardInterrupt:
+        print("\n🛑 Server shutting down...")
+    except Exception as e:
+        print(f"🛑 Fatal Error: {e}")
