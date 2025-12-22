@@ -36,16 +36,17 @@ class DeviceContext:
             self.event_cls = torch.npu.Event
             self._sync_func = torch.npu.synchronize
             self._empty_cache_func = torch.npu.empty_cache
-            print(f"✅ [DeviceContext] Activated: NPU ({torch.npu.get_device_name(0)})")
+            # print(f"✅ [DeviceContext] Activated: NPU ({torch.npu.get_device_name(0)})")
         elif torch.cuda.is_available():
             self.device_type = 'cuda'
             self.device_str = 'cuda:0'
             self.event_cls = torch.cuda.Event
             self._sync_func = torch.cuda.synchronize
             self._empty_cache_func = torch.cuda.empty_cache
-            print(f"✅ [DeviceContext] Activated: CUDA ({torch.cuda.get_device_name(0)})")
+            # print(f"✅ [DeviceContext] Activated: CUDA ({torch.cuda.get_device_name(0)})")
         else:
-            print(f"⚠️ [DeviceContext] Activated: CPU only")
+            pass
+            # print(f"⚠️ [DeviceContext] Activated: CPU only")
 
     def synchronize(self):
         self._sync_func()
@@ -111,15 +112,35 @@ class OperatorBenchmark:
         return None
 
     def _format_arg_summary(self, args, kwargs) -> str:
-        if not self.verbose: return ""
-        # 简化的参数打印，避免递归过深
-        def simple_fmt(x):
-            if isinstance(x, torch.Tensor):
-                return f"Tensor({list(x.shape)}, {str(x.dtype).replace('torch.', '')})"
-            return str(type(x).__name__)
-        
-        arg_str = ", ".join([simple_fmt(a) for a in args])
-        return f"Args: [{arg_str}]"
+            if not self.verbose: return ""
+
+            def simple_fmt(x):
+                # 1.如果是 Tensor，打印 Shape 和 Dtype
+                if isinstance(x, torch.Tensor):
+                    shape_str = str(list(x.shape))
+                    dtype_str = str(x.dtype).replace('torch.', '')
+                    return f"Tensor({shape_str}, {dtype_str})"
+                
+                # 2. 【关键修改】如果是列表或元组，递归打印内部内容
+                elif isinstance(x, (list, tuple)):
+                    inner = ", ".join([simple_fmt(item) for item in x])
+                    return f"[{inner}]"
+                
+                # 3.如果是基础类型，直接显示值
+                elif isinstance(x, (int, float, str, bool)):
+                    return str(x)
+                    
+                # 4.其他情况打印类型名
+                return str(type(x).__name__)
+            
+            arg_str = ", ".join([simple_fmt(a) for a in args])
+            
+            # 如果 kwargs 也有内容，顺便打印出来
+            if kwargs:
+                kwarg_str = ", ".join([f"{k}={simple_fmt(v)}" for k, v in kwargs.items()])
+                return f"Args: {arg_str} | Kwargs: {kwarg_str}"
+                
+            return f"Args: {arg_str}"
 
     def benchmark(self, node: Any, dummy_args: Tuple[Any, ...], dummy_kwargs: Dict[str, Any]) -> Tuple[bool, float]:
         target_str = str(node.target)
@@ -189,7 +210,8 @@ class OperatorBenchmark:
 
         except Exception as e:
             if self.verbose:
-                print(f"❌ [Exec Error] {node.name}: {str(e)}")
+                pass
+                # print(f"❌ [Exec Error] {node.name}: {str(e)}")
                 # traceback.print_exc() # 可选：打印详细堆栈
             return False, 0.0
         finally:
@@ -220,8 +242,9 @@ class DataReconstructor:
                     dtype = cls._str_to_dtype(arg['dtype'])
                     return CTX.create_tensor(arg['shape'], dtype)
                 except Exception as e:
-                    print(f"\n❌ [Data Error] Failed to create tensor: {arg}")
-                    raise e
+                    pass
+                    # print(f"\n❌ [Data Error] Failed to create tensor: {arg}")
+                    # raise e
             return {k: cls.reconstruct(v) for k, v in arg.items()}
         else:
             return arg
@@ -239,7 +262,7 @@ class MockNode:
 # 5. Server 通信逻辑
 # ==============================================================================
 class BenchmarkServer:
-    def __init__(self, port=5555):
+    def __init__(self, port=5588):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         # 设置 Linger 为 0，防止 Ctrl+C 时 socket 卡死
@@ -279,8 +302,9 @@ class BenchmarkServer:
                 self.socket.send(resp)
 
             except Exception as e:
-                print(f"❌ [Server Loop Error] {e}")
-                traceback.print_exc()
+                pass
+                # print(f"❌ [Server Loop Error] {e}")
+                # traceback.print_exc()
                 
                 # 关键：确保 Send 被调用，否则 Client 会一直等待 recv 导致死锁
                 try:

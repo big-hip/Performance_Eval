@@ -3,16 +3,20 @@ import torch
 import torch.fx as fx
 import threading
 from numpy import double 
-from ..Cost_model.costmodel import CostModel 
+from ..Cost_model.costmodel import CostModel, Really_run
 from .Memory_manage import LifeTime, LifeTime_mp
 class Compute:
     """
         If the computing unit is idle, it indicates that computation can begin.
 
     """
-    def __init__(self, comp_queue) -> None:
+    def __init__(self, comp_queue, really_run:bool = False) -> None:
         self.comp_queue = comp_queue
         self.cost_model=CostModel()
+        if really_run:
+            self.cost_model = Really_run()
+        else:
+            self.cost_model = CostModel()
     def check_compute_ready(self,node:fx.Node, mem:dict) -> bool:
         """
             Check whether the data required for computation is ready.

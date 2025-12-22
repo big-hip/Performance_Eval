@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from .Memory_manage import LifeTime, LifeTime_mp
 from numpy import double
-from ..Cost_model.costmodel import CostModel
+from ..Cost_model.costmodel import CostModel, Really_run
 
 
 @dataclass
@@ -25,11 +25,14 @@ class Link:
         Manage network topology and communication link states.
         Each Link object corresponds to one device's communication manager thread.
     """
-    def __init__(self, topo_graph: nx.Graph = nx.Graph()):
+    def __init__(self, topo_graph: nx.Graph = nx.Graph(), really_run:bool = False):
         self.topo_graph = topo_graph
         self.link_states = self._init_link_states(topo_graph)
-        self.cost_model=CostModel()
-
+        if really_run:
+            self.cost_model = Really_run()
+        else:
+            self.cost_model = CostModel()
+        
     # --------------------------------------------------------
     # --- Initialization & link management ---
     # --------------------------------------------------------
@@ -145,6 +148,7 @@ class Link:
         # cost_model = CostModel(type=comm_type, input=list(node.all_input_nodes))
         if not isinstance(node, str):
             comm_time = self.cost_model.get_communication_time(node) 
+            # comm_time = 1
         else:
             comm_time =0
         return comm_time

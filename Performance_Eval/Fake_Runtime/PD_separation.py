@@ -21,13 +21,14 @@ class PD_Performance_Eval:
         return:
             total_time : The total estimated time for the PD separation strategy.
     """
-    def __init__(self, original_prefill_FW, original_decode_FW, prefill_graph, decode_graph, inp_seq_len, res_seq_len):
+    def __init__(self, original_prefill_FW, original_decode_FW, prefill_graph, decode_graph, inp_seq_len, res_seq_len, really_run:bool = False):
         self.original_prefill_FW = copy.deepcopy(original_prefill_FW)
         self.original_decode_FW = copy.deepcopy(original_decode_FW)
         self.prefill_graph = prefill_graph
         self.decode_graph = decode_graph
         self.inp_seq_len = inp_seq_len
         self.res_seq_len = res_seq_len
+        self.really_run = really_run
 
 
     def _get_shape_env(self, gm: GraphModule) -> ShapeEnv:
@@ -55,7 +56,7 @@ class PD_Performance_Eval:
     def Evaluate(self) -> double:
         # Step 1 : Evaluate Prefill Stage
         time1 = 0.0
-        P_Stage_Eval = Performance_Evaluation(self.prefill_graph)
+        P_Stage_Eval = Performance_Evaluation(self.prefill_graph, really_run = self.really_run)
         time1 += P_Stage_Eval.Evaluate()
         print("Prefill Stage Evaluation Time: ", time1)
 
@@ -92,14 +93,14 @@ class PD_Performance_Eval:
             if shape_env is not None:
                 seq_sym = self._modify_seq_sym(shape_env, curr_seq_len)
                 self.decode_graph.run()
-                D_Stage_Eval = Performance_Evaluation(self.decode_graph)
+                D_Stage_Eval = Performance_Evaluation(self.decode_graph, really_run = self.really_run)
                 time_every_step = D_Stage_Eval.Evaluate()
                 print("Decode Step ", i+1, " Evaluation Time: ", time_every_step)
                 time3 += time_every_step
                 if seq_sym is not None:
                     shape_env.var_to_val[seq_sym] = self.inp_seq_len
             else:
-                D_Stage_Eval = Performance_Evaluation(self.decode_graph)
+                D_Stage_Eval = Performance_Evaluation(self.decode_graph, really_run = self.really_run)
                 time_every_step = D_Stage_Eval.Evaluate()
                 print("Decode Step ", i+1, " Evaluation Time: ", time_every_step)
                 time3 += time_every_step

@@ -195,7 +195,8 @@ def device_process(device_id:int,
                    link_manage:list[Link], 
                    group_barriers, 
                    pp_stage_gap, 
-                   global_lock) -> double:
+                   global_lock,
+                   really_run) -> double:
     
     print(f"[Device {device_id}] Process started (PID: {mp.current_process().pid}).")
     group_barriers[f'All-devices-sync'].wait()
@@ -247,7 +248,7 @@ def device_process(device_id:int,
 
     from collections import defaultdict
     barrier_rounds = defaultdict(int)
-    compute_manage = Compute_manage.Compute(q)
+    compute_manage = Compute_manage.Compute(q, really_run=really_run)
     
     # --- 主循环 ---
     group_barriers[f"All-devices-sync"].wait()
@@ -516,7 +517,7 @@ class InferenceSchedule:
     
 
 class Performance_Evaluation:
-    def __init__(self, HybridParallel:Hybrid_Parallel, Topology_Graph:nx.Graph = nx.Graph(), TaskGraph:nx.Graph = nx.Graph(), Mode:str ='Inference', KV_Cache:bool = False, PP_sched:str = 'FthenB') -> None: 
+    def __init__(self, HybridParallel:Hybrid_Parallel, Topology_Graph:nx.Graph = nx.Graph(), TaskGraph:nx.Graph = nx.Graph(), Mode:str ='Inference', KV_Cache:bool = False, PP_sched:str = 'FthenB', really_run:bool = False) -> None: 
         self.Dist_IR = HybridParallel.dist_IR
         self.Device_nums = HybridParallel.device_nums
         self.T = HybridParallel.T
@@ -527,6 +528,7 @@ class Performance_Evaluation:
         self.Mode = Mode
         self.KV_Cache = KV_Cache
         self.PP_sched = PP_sched
+        self.really_run = really_run
 
     def Evaluate(self) -> double:
         assert self.Mode in ['Training','Inference']
@@ -544,7 +546,7 @@ class Performance_Evaluation:
         # 1. 获取 Spawn Context
         ctx = mp.get_context('spawn')
         
-        link_manage = Link(Topology_Graph)
+        link_manage = Link(Topology_Graph, self.really_run)
         pp_stage_gap = self.T * self.M * self.S 
 
         # 2. 提取通信组
@@ -641,7 +643,7 @@ class Performance_Evaluation:
         for i in range(real_device_nums):
             p = ctx.Process(
                 target=device_process,
-                args=(i, safe_sched_queue[i], local_time_list, [link_manage], global_barriers, pp_stage_gap, global_lock),
+                args=(i, safe_sched_queue[i], local_time_list, [link_manage], global_barriers, pp_stage_gap, global_lock, self.really_run),
                 daemon=True
             )
             processes.append(p)
@@ -660,3 +662,4 @@ class Performance_Evaluation:
         
         gc.collect()
         return Global_time
+        # return Global_time ,local_time_list
